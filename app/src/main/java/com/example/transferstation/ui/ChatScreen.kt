@@ -253,7 +253,7 @@ fun ChatScreen(
             contentWindowInsets = WindowInsets(0.dp, 0.dp, 0.dp, 0.dp),
             topBar = {
                 ChatTopBar(
-                    title = currentSession?.title ?: "多模型 AI",
+                    title = currentSession?.title ?: stringResource(R.string.app_name),
                     runningCount = runningCount,
                     drawerState = drawerState,
                     onCloseDrawer = { scope.launch { drawerState.close() } },
