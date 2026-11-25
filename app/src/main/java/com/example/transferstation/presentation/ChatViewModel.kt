@@ -7,6 +7,7 @@ import com.example.transferstation.MainApplication
 import com.example.transferstation.data.repository.ChatRepository
 import com.example.transferstation.data.repository.RepositorySnapshot
 import com.example.transferstation.domain.model.ChatMessage
+import com.example.transferstation.domain.model.AppearanceSettings
 import com.example.transferstation.domain.model.ChatSession
 import com.example.transferstation.domain.model.GenerationState
 import com.example.transferstation.domain.model.ModelInfo
@@ -15,7 +16,6 @@ import com.example.transferstation.domain.model.PendingAttachment
 import com.example.transferstation.domain.model.ProviderConnection
 import com.example.transferstation.domain.model.ProviderConnectionInfo
 import com.example.transferstation.domain.model.ProviderKind
-import com.example.transferstation.domain.model.UserPreferences
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -46,6 +46,7 @@ data class ChatUiState(
     val reasoningLevel: String? = null,
     val pendingAttachments: List<PendingAttachment> = emptyList(),
     val isLoadingMessages: Boolean = false,
+    val isSendingMessage: Boolean = false,
     val isBusy: Boolean = false,
     val errorMessage: String? = null,
     val infoMessage: String? = null,
@@ -275,38 +276,38 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /** 在会话中确认仅发送文字后提交用户请求。 */
-    fun send(text: String, sessionId: String, omitImages: Boolean) {
+    /** 提交当前会话的消息，并随首次发送提交用户的传输确认。 */
+    fun send(text: String, sessionId: String, omitImages: Boolean, transferConfirmed: Boolean) {
         viewModelScope.launch {
             val current = mutableState.value
+            if (current.isSendingMessage || current.openSessionId != sessionId) return@launch
             val connectionId = current.selectedProviderId ?: return@launch setError("请先配置模型服务商 API。")
             val connection = current.snapshot.connections.firstOrNull { it.id == connectionId } ?: return@launch setError("请选择已配置的模型服务商。")
             val model = current.selectedModelId?.let { selectedModel(connection, it) } ?: return@launch setError("请先选择一个模型。")
             val level = current.reasoningLevel?.takeIf { model.reasoningLevels.contains(it) }
-            perform {
-                val payload = if (omitImages) emptyList() else current.pendingAttachments
-                repository.sendMessage(sessionId, text.trim(), payload, connection.id, model, level)
-                update { it.copy(pendingAttachments = emptyList(), infoMessage = null) }
-                refreshMessages(sessionId)
+            update { it.copy(isSendingMessage = true) }
+            try {
+                perform {
+                    val payload = if (omitImages) emptyList() else current.pendingAttachments
+                    repository.sendMessage(sessionId, text.trim(), payload, connection.id, model, level, transferConfirmed)
+                    update { if (it.openSessionId == sessionId) it.copy(pendingAttachments = emptyList()) else it }
+                    refreshMessages(sessionId)
+                }
+            } finally {
+                update { it.copy(isSendingMessage = false) }
             }
-        }
-    }
-
-    /** 标记用户已同意向该模型服务商发送会话内容。 */
-    fun confirmProviderTransfer(connectionId: String) {
-        viewModelScope.launch {
-            val preferences = repository.preferences().copy(
-                confirmedProviderIds = repository.preferences().confirmedProviderIds + connectionId,
-            )
-            repository.savePreferences(preferences)
-            setInfo("已记录本机的数据传输确认。")
         }
     }
 
     /** 更新主题模式并保存在本机。 */
     fun setTheme(themeMode: String) {
+        setAppearanceSettings(mutableState.value.snapshot.appearanceSettings.copy(themeMode = themeMode))
+    }
+
+    /** 更新完整外观偏好并由 Repository 持久化到 SQLite。 */
+    fun setAppearanceSettings(settings: AppearanceSettings) {
         viewModelScope.launch {
-            repository.savePreferences(repository.preferences().copy(themeMode = themeMode))
+            repository.saveAppearanceSettings(settings)
         }
     }
 

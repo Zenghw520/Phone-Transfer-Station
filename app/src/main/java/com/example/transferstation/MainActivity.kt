@@ -43,7 +43,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             val stateHolder: ChatViewModel = viewModel()
             val state by stateHolder.state.collectAsState()
-            TransferStationTheme(themeMode = state.snapshot.preferences.themeMode) {
+            TransferStationTheme(appearance = state.snapshot.appearanceSettings) {
                 ChatScreen(initialSessionId = initialSessionId, viewModel = stateHolder)
             }
         }

@@ -1,0 +1,11 @@
+SoftGlass 0.1.3
+Copyright (C) Haooz
+License: Apache-2.0
+Source: https://github.com/HaoZai000/SoftGlass
+License text: SoftGlass-APACHE-2.0.txt
+
+JTokkit 1.1.0
+Copyright (c) 2023 Knuddels, Philip Müller
+License: MIT
+Source: https://github.com/knuddelsgmbh/jtokkit
+License text: jtokkit-MIT.txt

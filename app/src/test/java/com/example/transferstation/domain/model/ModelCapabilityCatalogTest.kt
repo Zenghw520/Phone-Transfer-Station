@@ -32,7 +32,7 @@ class ModelCapabilityCatalogTest {
     /** 为实际支持推理强度的系列提供低中高三档设置。 */
     @Test
     fun `reasoning levels are limited to supported model families`() {
-        assertEquals(listOf("低", "中", "高"), ModelCapabilityCatalog.describe(ProviderKind.OPENAI, "o3-mini").reasoningLevels)
+        assertEquals(listOf("low", "medium", "high"), ModelCapabilityCatalog.describe(ProviderKind.OPENAI, "o3-mini").reasoningLevels)
         assertEquals(listOf("低", "中", "高"), ModelCapabilityCatalog.describe(ProviderKind.DEEPSEEK, "deepseek-reasoner").reasoningLevels)
         assertEquals(emptyList<String>(), ModelCapabilityCatalog.describe(ProviderKind.OPENAI, "gpt-4o").reasoningLevels)
     }
@@ -43,8 +43,8 @@ class ModelCapabilityCatalogTest {
         val listedModel = ModelCapabilityCatalog.describe(ProviderKind.CUSTOM, "gpt-5.1")
         val manualModel = ModelCapabilityCatalog.manual(ProviderKind.CUSTOM, "o3-mini", false, emptyList())
 
-        assertEquals(listOf("低", "中", "高"), listedModel.reasoningLevels)
-        assertEquals(listOf("低", "中", "高"), manualModel.reasoningLevels)
+        assertEquals(listOf("minimal", "low", "medium", "high", "xhigh"), listedModel.reasoningLevels)
+        assertEquals(listOf("low", "medium", "high"), manualModel.reasoningLevels)
         assertFalse(listedModel.supportsImages)
     }
 

@@ -53,12 +53,23 @@ data class ProviderConnectionInfo(
     val lastValidatedAt: Long?,
 )
 
-/** 会话记录及其最近更新时间。 */
+/** 会话标题、AI 摘要预览和最近更新时间。 */
 data class ChatSession(
     val id: String,
     val title: String,
     val createdAt: Long,
     val updatedAt: Long,
+    val summary: String? = null,
+)
+
+/** 应用统一外观偏好，供聊天页、设置页和系统栏共同读取。 */
+data class AppearanceSettings(
+    val themeMode: String = "system",
+    val monetColorEnabled: Boolean = false,
+    val accentColorHex: String = "#315FBA",
+    val liquidGlassEnabled: Boolean = false,
+    val inputLiquidGlassEnabled: Boolean = false,
+    val scaleFactor: Float = 1f,
 )
 
 /** 一条聊天消息，包括本地图片路径和回答模型快照。 */
@@ -105,7 +116,7 @@ enum class GenerationState {
     }
 }
 
-/** 已提交的生成任务，包含请求时使用的配置快照和部分输出。 */
+/** 已提交的生成任务快照，包括请求配置、部分输出和 token 速率。 */
 data class GenerationTask(
     val id: String,
     val sessionId: String,
@@ -126,9 +137,12 @@ data class GenerationTask(
     val startedAt: Long? = null,
     val completedAt: Long? = null,
     val errorMessage: String? = null,
+    val outputTokenCount: Int = 0,
+    val outputTokensPerSecond: Double? = null,
+    val tokenRateEstimated: Boolean = false,
 )
 
-/** 供聊天界面展示的任务摘要，不暴露加密前的密钥快照。 */
+/** 供聊天界面和状态通知展示的任务摘要，不暴露 API Key。 */
 data class GenerationTaskInfo(
     val id: String,
     val sessionId: String,
@@ -146,14 +160,17 @@ data class GenerationTaskInfo(
     val startedAt: Long?,
     val completedAt: Long?,
     val errorMessage: String?,
+    val outputTokenCount: Int = 0,
+    val outputTokensPerSecond: Double? = null,
+    val tokenRateEstimated: Boolean = false,
 )
 
-/** 对话界面当前选择的服务商、模型与主题偏好。 */
+/** 本机的模型选择、主题偏好及首次发送确认状态。 */
 data class UserPreferences(
     val selectedProviderId: String? = null,
     val selectedModelId: String? = null,
     val themeMode: String = "system",
-    val confirmedProviderIds: Set<String> = emptySet(),
+    val hasConfirmedMessageTransfer: Boolean = false,
 )
 
 /** 用户下一条消息的附件草稿。 */

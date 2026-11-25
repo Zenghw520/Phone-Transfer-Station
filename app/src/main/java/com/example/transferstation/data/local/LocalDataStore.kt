@@ -9,6 +9,7 @@ import android.security.keystore.KeyProperties
 import android.util.Base64
 import com.example.transferstation.domain.model.ChatMessage
 import com.example.transferstation.domain.model.ChatSession
+import com.example.transferstation.domain.model.AppearanceSettings
 import com.example.transferstation.domain.model.GenerationState
 import com.example.transferstation.domain.model.GenerationTask
 import com.example.transferstation.domain.model.MessageRole
@@ -26,23 +27,28 @@ import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
 /** 负责将会话、消息、服务商配置和生成任务持久化到应用私有数据库。 */
-class LocalDataStore(context: Context) : SQLiteOpenHelper(context, DATABASE_NAME, null, DATABASE_VERSION), Closeable {
+class LocalDataStore(context: Context, databaseName: String = DATABASE_NAME) : SQLiteOpenHelper(context, databaseName, null, DATABASE_VERSION), Closeable {
     private val preferences = context.getSharedPreferences("chat_preferences", Context.MODE_PRIVATE)
 
     /** 初始化数据库表结构，服务商密钥使用独立 Keystore 密钥加密。 */
     override fun onCreate(database: SQLiteDatabase) {
         database.execSQL("CREATE TABLE providers (id TEXT PRIMARY KEY NOT NULL, kind TEXT NOT NULL, name TEXT NOT NULL, base_url TEXT NOT NULL, api_key TEXT NOT NULL, custom_images INTEGER NOT NULL, reasoning_levels TEXT NOT NULL, models TEXT NOT NULL, validated_at INTEGER)")
-        database.execSQL("CREATE TABLE sessions (id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)")
+        database.execSQL("CREATE TABLE sessions (id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, summary TEXT)")
         database.execSQL("CREATE TABLE messages (id TEXT PRIMARY KEY NOT NULL, session_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, images TEXT NOT NULL, created_at INTEGER NOT NULL, provider_name TEXT, model_name TEXT, reasoning_level TEXT, reasoning_summary TEXT, duration_ms INTEGER, task_id TEXT)")
         database.execSQL("CREATE INDEX messages_session_index ON messages(session_id, created_at)")
-        database.execSQL("CREATE TABLE tasks (id TEXT PRIMARY KEY NOT NULL, session_id TEXT NOT NULL, user_message_id TEXT NOT NULL, assistant_message_id TEXT NOT NULL, provider_id TEXT NOT NULL, provider_kind TEXT NOT NULL, provider_name TEXT NOT NULL, base_url TEXT NOT NULL, model_id TEXT NOT NULL, model_name TEXT NOT NULL, supports_images INTEGER NOT NULL, api_key TEXT NOT NULL, reasoning_level TEXT, state TEXT NOT NULL, assistant_text TEXT NOT NULL, reasoning_summary TEXT, started_at INTEGER, completed_at INTEGER, error_message TEXT)")
+        database.execSQL("CREATE TABLE tasks (id TEXT PRIMARY KEY NOT NULL, session_id TEXT NOT NULL, user_message_id TEXT NOT NULL, assistant_message_id TEXT NOT NULL, provider_id TEXT NOT NULL, provider_kind TEXT NOT NULL, provider_name TEXT NOT NULL, base_url TEXT NOT NULL, model_id TEXT NOT NULL, model_name TEXT NOT NULL, supports_images INTEGER NOT NULL, api_key TEXT NOT NULL, reasoning_level TEXT, state TEXT NOT NULL, assistant_text TEXT NOT NULL, reasoning_summary TEXT, started_at INTEGER, completed_at INTEGER, error_message TEXT, output_token_count INTEGER NOT NULL DEFAULT 0, output_tokens_per_second REAL, token_rate_estimated INTEGER NOT NULL DEFAULT 0)")
         database.execSQL("CREATE INDEX tasks_state_index ON tasks(state)")
+        createAppearanceSettingsTable(database)
     }
 
-    /** 为未来数据库版本保留明确的迁移入口，不静默删除用户数据。 */
+    /** 迁移旧会话摘要、任务计数列和 SharedPreferences 中的主题模式。 */
     override fun onUpgrade(database: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        if (oldVersion != newVersion) {
-            throw IllegalStateException("不支持从数据库版本 $oldVersion 迁移到 $newVersion")
+        if (oldVersion < 2) {
+            database.execSQL("ALTER TABLE sessions ADD COLUMN summary TEXT")
+            database.execSQL("ALTER TABLE tasks ADD COLUMN output_token_count INTEGER NOT NULL DEFAULT 0")
+            database.execSQL("ALTER TABLE tasks ADD COLUMN output_tokens_per_second REAL")
+            database.execSQL("ALTER TABLE tasks ADD COLUMN token_rate_estimated INTEGER NOT NULL DEFAULT 0")
+            createAppearanceSettingsTable(database, preferences.getString("theme_mode", "system") ?: "system")
         }
     }
 
@@ -100,7 +106,7 @@ class LocalDataStore(context: Context) : SQLiteOpenHelper(context, DATABASE_NAME
         return ChatSession(UUID.randomUUID().toString(), "新对话", now, now).also(::saveSession)
     }
 
-    /** 保存会话标题和最近更新时间。 */
+    /** 保存会话标题、摘要及最近更新时间。 */
     @Synchronized
     fun saveSession(session: ChatSession) {
         val values = ContentValues().apply {
@@ -108,8 +114,15 @@ class LocalDataStore(context: Context) : SQLiteOpenHelper(context, DATABASE_NAME
             put("title", session.title)
             put("created_at", session.createdAt)
             put("updated_at", session.updatedAt)
+            session.summary?.let { put("summary", it) } ?: putNull("summary")
         }
         writableDatabase.insertWithOnConflict("sessions", null, values, SQLiteDatabase.CONFLICT_REPLACE)
+    }
+
+    /** 更新会话列表显示的 AI 摘要或最近消息预览。 */
+    @Synchronized
+    fun saveSessionSummary(sessionId: String, summary: String) {
+        writableDatabase.execSQL("UPDATE sessions SET summary = ? WHERE id = ?", arrayOf(summary, sessionId))
     }
 
     /** 按最近更新时间倒序读取全部会话。 */
@@ -117,7 +130,7 @@ class LocalDataStore(context: Context) : SQLiteOpenHelper(context, DATABASE_NAME
     fun getSessions(): List<ChatSession> = readableDatabase.rawQuery("SELECT * FROM sessions ORDER BY updated_at DESC", null).use { cursor ->
         buildList {
             while (cursor.moveToNext()) add(
-                ChatSession(cursor.getString(0), cursor.getString(1), cursor.getLong(2), cursor.getLong(3)),
+                ChatSession(cursor.getString(0), cursor.getString(1), cursor.getLong(2), cursor.getLong(3), cursor.stringOrNull(4)),
             )
         }
     }
@@ -136,7 +149,7 @@ class LocalDataStore(context: Context) : SQLiteOpenHelper(context, DATABASE_NAME
         }
     }
 
-    /** 保存用户消息或增量更新中的模型回答。 */
+    /** 保存消息正文并刷新最近消息预览及会话更新时间。 */
     @Synchronized
     fun saveMessage(message: ChatMessage) {
         val values = ContentValues().apply {
@@ -154,7 +167,17 @@ class LocalDataStore(context: Context) : SQLiteOpenHelper(context, DATABASE_NAME
             message.taskId?.let { put("task_id", it) } ?: putNull("task_id")
         }
         writableDatabase.insertWithOnConflict("messages", null, values, SQLiteDatabase.CONFLICT_REPLACE)
-        writableDatabase.execSQL("UPDATE sessions SET updated_at = ?, title = CASE WHEN title = '新对话' AND ? <> '' THEN ? ELSE title END WHERE id = ?", arrayOf<Any?>(message.createdAt, message.text, message.text.take(56), message.sessionId))
+        val preview = if (message.role == MessageRole.USER) {
+            message.text.replace(Regex("\\s+"), " ").trim().take(120).ifBlank {
+                if (message.imagePaths.isNotEmpty()) "图片消息" else ""
+            }
+        } else {
+            null
+        }
+        writableDatabase.execSQL(
+            "UPDATE sessions SET updated_at = ?, title = CASE WHEN title = '新对话' AND ? <> '' THEN ? ELSE title END, summary = COALESCE(?, summary) WHERE id = ?",
+            arrayOf<Any?>(message.createdAt, message.text, message.text.take(56), preview, message.sessionId),
+        )
     }
 
     /** 读取单个会话的全部消息并按创建时间排序。 */
@@ -206,6 +229,9 @@ class LocalDataStore(context: Context) : SQLiteOpenHelper(context, DATABASE_NAME
             task.startedAt?.let { put("started_at", it) } ?: putNull("started_at")
             task.completedAt?.let { put("completed_at", it) } ?: putNull("completed_at")
             task.errorMessage?.let { put("error_message", it) } ?: putNull("error_message")
+            put("output_token_count", task.outputTokenCount)
+            task.outputTokensPerSecond?.let { put("output_tokens_per_second", it) } ?: putNull("output_tokens_per_second")
+            put("token_rate_estimated", if (task.tokenRateEstimated) 1 else 0)
         }
         writableDatabase.insertWithOnConflict("tasks", null, values, SQLiteDatabase.CONFLICT_REPLACE)
     }
@@ -233,23 +259,83 @@ class LocalDataStore(context: Context) : SQLiteOpenHelper(context, DATABASE_NAME
         )
     }
 
-    /** 保存当前模型选择和主题设置。 */
+    /** 保存当前模型选择，并将主题偏好单独保存到 SQLite。 */
+    @Synchronized
     fun savePreferences(value: UserPreferences) {
         preferences.edit()
             .putString("selected_provider_id", value.selectedProviderId)
             .putString("selected_model_id", value.selectedModelId)
-            .putString("theme_mode", value.themeMode)
-            .putStringSet("confirmed_provider_ids", value.confirmedProviderIds)
             .apply()
+        saveAppearanceSettings(getAppearanceSettings().copy(themeMode = value.themeMode))
     }
 
-    /** 读取模型选择和主题设置，首次使用时默认跟随系统。 */
+    /** 读取模型选择、全局发送确认及 SQLite 中的主题模式。 */
+    @Synchronized
     fun getPreferences(): UserPreferences = UserPreferences(
         selectedProviderId = preferences.getString("selected_provider_id", null),
         selectedModelId = preferences.getString("selected_model_id", null),
-        themeMode = preferences.getString("theme_mode", "system") ?: "system",
-        confirmedProviderIds = preferences.getStringSet("confirmed_provider_ids", emptySet())?.toSet() ?: emptySet(),
+        themeMode = getAppearanceSettings().themeMode,
+        hasConfirmedMessageTransfer = hasConfirmedMessageTransfer(),
     )
+
+    /** 读取全局发送确认，并沿用旧版对任一服务商的确认记录。 */
+    fun hasConfirmedMessageTransfer(): Boolean =
+        preferences.getBoolean("message_transfer_confirmed", false) ||
+            preferences.getStringSet("confirmed_provider_ids", emptySet()).orEmpty().isNotEmpty()
+
+    /** 保存全局发送确认，模型选择及服务商配置的写入不会覆盖它。 */
+    fun confirmMessageTransfer() {
+        preferences.edit().putBoolean("message_transfer_confirmed", true).apply()
+    }
+
+    /** 保存完整外观设置并即时供后续界面快照读取。 */
+    @Synchronized
+    fun saveAppearanceSettings(value: AppearanceSettings) {
+        val settings = ContentValues().apply {
+            put("id", 1)
+            put("theme_mode", value.themeMode)
+            put("monet_enabled", if (value.monetColorEnabled) 1 else 0)
+            put("accent_color_hex", value.accentColorHex)
+            put("liquid_glass_enabled", if (value.liquidGlassEnabled) 1 else 0)
+            put("input_glass_enabled", if (value.inputLiquidGlassEnabled) 1 else 0)
+            put("scale_factor", value.scaleFactor)
+        }
+        writableDatabase.insertWithOnConflict("appearance_settings", null, settings, SQLiteDatabase.CONFLICT_REPLACE)
+    }
+
+    /** 读取持久化的外观偏好，缺少记录时返回应用默认外观。 */
+    @Synchronized
+    fun getAppearanceSettings(): AppearanceSettings = readableDatabase.rawQuery(
+        "SELECT theme_mode, monet_enabled, accent_color_hex, liquid_glass_enabled, input_glass_enabled, scale_factor FROM appearance_settings WHERE id = 1",
+        null,
+    ).use { cursor ->
+        if (!cursor.moveToFirst()) return@use AppearanceSettings()
+        AppearanceSettings(
+            themeMode = cursor.getString(0),
+            monetColorEnabled = cursor.getInt(1) != 0,
+            accentColorHex = cursor.getString(2),
+            liquidGlassEnabled = cursor.getInt(3) != 0,
+            inputLiquidGlassEnabled = cursor.getInt(4) != 0,
+            scaleFactor = cursor.getFloat(5),
+        )
+    }
+
+    /** 创建外观设置表并导入首次安装或旧版偏好中的主题模式。 */
+    private fun createAppearanceSettingsTable(database: SQLiteDatabase, themeMode: String = "system") {
+        database.execSQL(
+            "CREATE TABLE appearance_settings (id INTEGER PRIMARY KEY NOT NULL CHECK(id = 1), theme_mode TEXT NOT NULL, monet_enabled INTEGER NOT NULL, accent_color_hex TEXT NOT NULL, liquid_glass_enabled INTEGER NOT NULL, input_glass_enabled INTEGER NOT NULL, scale_factor REAL NOT NULL)",
+        )
+        val defaults = ContentValues().apply {
+            put("id", 1)
+            put("theme_mode", themeMode)
+            put("monet_enabled", 0)
+            put("accent_color_hex", "#315FBA")
+            put("liquid_glass_enabled", 0)
+            put("input_glass_enabled", 0)
+            put("scale_factor", 1f)
+        }
+        database.insertOrThrow("appearance_settings", null, defaults)
+    }
 
     /** 确保应用私有 Android Keystore 中存在 AES-256 加密密钥。 */
     private fun secretKey(): SecretKey {
@@ -339,6 +425,9 @@ class LocalDataStore(context: Context) : SQLiteOpenHelper(context, DATABASE_NAME
             startedAt = cursor.longOrNull(16),
             completedAt = cursor.longOrNull(17),
             errorMessage = cursor.stringOrNull(18),
+            outputTokenCount = cursor.getInt(19),
+            outputTokensPerSecond = if (cursor.isNull(20)) null else cursor.getDouble(20),
+            tokenRateEstimated = cursor.getInt(21) != 0,
         )
     }
 
@@ -393,7 +482,7 @@ class LocalDataStore(context: Context) : SQLiteOpenHelper(context, DATABASE_NAME
 
     private companion object {
         const val DATABASE_NAME = "transfer_station.db"
-        const val DATABASE_VERSION = 1
+        const val DATABASE_VERSION = 2
         const val KEY_ALIAS = "transfer_station_api_key_v1"
         const val TRANSFORMATION = "AES/GCM/NoPadding"
         const val GCM_IV_LENGTH = 12

@@ -19,9 +19,11 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        maven("https://jitpack.io") {
+            content { includeGroup("com.github.HaoZai000.SoftGlass") }
+        }
     }
 }
 
 rootProject.name = "Transfer Station"
 include(":app")
- 

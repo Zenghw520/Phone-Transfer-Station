@@ -2,11 +2,15 @@ package com.example.transferstation.data.repository
 
 import android.content.Context
 import android.content.Intent
+import android.util.Log
 import com.example.transferstation.data.local.ImageStore
 import com.example.transferstation.data.local.LocalDataStore
 import com.example.transferstation.data.provider.ProviderApi
+import com.example.transferstation.data.tokenization.OutputTokenCounter
+import com.example.transferstation.data.tokenization.calculateTokensPerSecond
 import com.example.transferstation.domain.model.ChatMessage
 import com.example.transferstation.domain.model.ChatSession
+import com.example.transferstation.domain.model.AppearanceSettings
 import com.example.transferstation.domain.model.GenerationState
 import com.example.transferstation.domain.model.GenerationTask
 import com.example.transferstation.domain.model.GenerationTaskInfo
@@ -29,12 +33,15 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.io.File
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 /** 聊天页面所需的本机数据快照。 */
 data class RepositorySnapshot(
@@ -42,6 +49,7 @@ data class RepositorySnapshot(
     val connections: List<ProviderConnectionInfo> = emptyList(),
     val tasks: List<GenerationTaskInfo> = emptyList(),
     val preferences: UserPreferences = UserPreferences(),
+    val appearanceSettings: AppearanceSettings = AppearanceSettings(),
 )
 
 /** 协调 SQLite、服务商适配、图片附件和多个聊天生成任务。 */
@@ -53,6 +61,7 @@ class ChatRepository(private val context: Context) {
     private val mutableSnapshot = MutableStateFlow(RepositorySnapshot())
     private val runningJobs = linkedMapOf<String, Job>()
     private val activeTaskIds = linkedSetOf<String>()
+    private val summaryMutexes = ConcurrentHashMap<String, Mutex>()
     private val snapshotLock = Any()
 
     /** 向界面公开持久化的会话、服务商和任务状态流。 */
@@ -74,7 +83,7 @@ class ChatRepository(private val context: Context) {
         dataStore.getMessages(sessionId)
     }
 
-    /** 获取当前保存的模型偏好。 */
+    /** 获取当前保存的模型偏好和首次发送确认状态。 */
     suspend fun preferences(): UserPreferences = withContext(Dispatchers.IO) {
         dataStore.getPreferences()
     }
@@ -148,7 +157,7 @@ class ChatRepository(private val context: Context) {
         imageStore.deleteImages(listOf(attachment.localPath))
     }
 
-    /** 保存新的用户消息及回复占位符并将请求加入三路并行生成队列。 */
+    /** 校验首次发送确认，保存新消息及回复占位符，并加入生成队列。 */
     suspend fun sendMessage(
         sessionId: String,
         text: String,
@@ -156,7 +165,9 @@ class ChatRepository(private val context: Context) {
         connectionId: String,
         model: ModelInfo,
         reasoningLevel: String?,
+        transferConfirmed: Boolean,
     ): String = withContext(Dispatchers.IO) {
+        require(transferConfirmed || dataStore.hasConfirmedMessageTransfer()) { "请先确认首次消息的数据传输说明。" }
         val connection = dataStore.getConnection(connectionId) ?: error("请先配置模型服务商 API。")
         require(connection.apiKey.isNotBlank()) { "请在服务商设置中录入 API Key。" }
         require(text.isNotBlank() || attachments.isNotEmpty()) { "请输入消息或添加图片。" }
@@ -217,6 +228,7 @@ class ChatRepository(private val context: Context) {
                 state = GenerationState.QUEUED,
             ),
         )
+        if (transferConfirmed) dataStore.confirmMessageTransfer()
         publishSnapshot()
         scheduleQueuedTasks()
         taskId
@@ -286,13 +298,19 @@ class ChatRepository(private val context: Context) {
         scheduleQueuedTasks()
     }
 
-    /** 保存外观、选定模型和已确认服务商的本机偏好。 */
+    /** 保存外观和选定模型的本机偏好。 */
     suspend fun savePreferences(value: UserPreferences) = withContext(Dispatchers.IO) {
         dataStore.savePreferences(value)
         publishSnapshot()
     }
 
-    /** 由前台服务运行单条流式生成任务并逐步写入可恢复回答。 */
+    /** 保存主题、玻璃效果和页面缩放设置，并同步更新界面快照。 */
+    suspend fun saveAppearanceSettings(value: AppearanceSettings) = withContext(Dispatchers.IO) {
+        dataStore.saveAppearanceSettings(value)
+        publishSnapshot()
+    }
+
+    /** 由前台服务运行流式任务，保存 token 速率并异步整理会话摘要。 */
     fun runTask(taskId: String, onFinished: () -> Unit) {
         synchronized(snapshotLock) {
             if (runningJobs.containsKey(taskId)) return
@@ -303,32 +321,88 @@ class ChatRepository(private val context: Context) {
                     val startedAt = System.currentTimeMillis()
                     var active = task.copy(state = GenerationState.CONNECTING, startedAt = startedAt)
                     val generationContext = currentCoroutineContext()
+                    val pendingText = StringBuilder()
+                    val pendingReasoningSummary = StringBuilder()
+                    val tokenCounter = OutputTokenCounter.forModel(task.providerKind, task.modelId)
+                    var lastProgressPersistAt = startedAt
+                    var lastTaskSnapshotAt = startedAt
+                    var lastTokenRateUpdatedAt = startedAt
+
+                    /** 合并短时间内收到的流式片段，减少重复数据库写入和完整快照刷新。 */
+                    fun flushPendingDeltas(force: Boolean = false) {
+                        val now = System.currentTimeMillis()
+                        if (pendingText.isEmpty() && pendingReasoningSummary.isEmpty()) {
+                            if (force) {
+                                persistTask(active)
+                                lastProgressPersistAt = now
+                            }
+                            return
+                        }
+                        val pendingLength = pendingText.length + pendingReasoningSummary.length
+                        if (!force && pendingLength < STREAM_SNAPSHOT_CHAR_THRESHOLD && now - lastTaskSnapshotAt < STREAM_SNAPSHOT_INTERVAL_MS) return
+
+                        var updatedTask = active.copy(
+                            state = GenerationState.STREAMING,
+                            assistantText = active.assistantText + pendingText,
+                            reasoningSummary = active.reasoningSummary.orEmpty() + pendingReasoningSummary,
+                        )
+                        if (updatedTask.assistantText.isNotBlank() && (force || now - lastTokenRateUpdatedAt >= TOKEN_RATE_UPDATE_INTERVAL_MS)) {
+                            val tokenCount = tokenCounter.count(updatedTask.assistantText)
+                            updatedTask = updatedTask.copy(
+                                outputTokenCount = tokenCount.count,
+                                outputTokensPerSecond = calculateTokensPerSecond(tokenCount.count, now - startedAt),
+                                tokenRateEstimated = tokenCount.estimated,
+                            )
+                            lastTokenRateUpdatedAt = now
+                        }
+                        active = updatedTask
+                        pendingText.setLength(0)
+                        pendingReasoningSummary.setLength(0)
+                        publishTaskProgress(active)
+                        lastTaskSnapshotAt = now
+                        if (force || now - lastProgressPersistAt >= STREAM_PERSIST_INTERVAL_MS) {
+                            persistTask(active)
+                            lastProgressPersistAt = now
+                        }
+                    }
+
                     persistTask(active)
                     publishSnapshot()
                     val history = requestHistory(active)
-                    providerApi.streamChat(
-                        task = active,
-                        history = history,
-                        onText = { delta ->
-                            if (delta.isNotEmpty()) {
-                                active = active.copy(state = GenerationState.STREAMING, assistantText = active.assistantText + delta)
-                                persistTask(active)
-                                publishSnapshot()
-                            }
-                        },
-                        onReasoningSummary = { summaryDelta ->
-                            if (summaryDelta.isNotEmpty()) {
-                                active = active.copy(reasoningSummary = active.reasoningSummary.orEmpty() + summaryDelta)
-                                persistTask(active)
-                                publishSnapshot()
-                            }
-                        },
-                        isCancelled = { !generationContext.isActive },
-                    )
+                    try {
+                        providerApi.streamChat(
+                            task = active,
+                            history = history,
+                            onText = { delta ->
+                                if (delta.isNotEmpty()) {
+                                    pendingText.append(delta)
+                                    flushPendingDeltas()
+                                }
+                            },
+                            onReasoningSummary = { summaryDelta ->
+                                if (summaryDelta.isNotEmpty()) {
+                                    pendingReasoningSummary.append(summaryDelta)
+                                    flushPendingDeltas()
+                                }
+                            },
+                            isCancelled = { !generationContext.isActive },
+                        )
+                    } finally {
+                        flushPendingDeltas(force = true)
+                    }
                     generationContext.ensureActive()
                     val completedAt = System.currentTimeMillis()
-                    persistTask(active.copy(state = GenerationState.COMPLETED, completedAt = completedAt))
+                    val finalTokenCount = tokenCounter.count(active.assistantText)
+                    active = active.copy(
+                        state = GenerationState.COMPLETED,
+                        completedAt = completedAt,
+                        outputTokenCount = finalTokenCount.count,
+                        outputTokensPerSecond = calculateTokensPerSecond(finalTokenCount.count, completedAt - startedAt),
+                        tokenRateEstimated = finalTokenCount.estimated,
+                    )
+                    persistTask(active)
                     publishSnapshot()
+                    scheduleSessionSummary(active)
                 } catch (exception: CancellationException) {
                     dataStore.getTask(taskId)?.let { task ->
                         if (task.state in setOf(GenerationState.CONNECTING, GenerationState.STREAMING)) {
@@ -402,18 +476,54 @@ class ChatRepository(private val context: Context) {
         )
     }
 
-    /** 维护最多三条跨会话并行请求并为同会话请求保留先後顺序。 */
+    /** 仅在内存快照中更新正在生成的任务，避免为每个增量重读整份数据库。 */
+    private fun publishTaskProgress(task: GenerationTask) {
+        synchronized(snapshotLock) {
+            val snapshot = mutableSnapshot.value
+            val existing = snapshot.tasks.firstOrNull { it.id == task.id }
+            val sessionTitle = existing?.sessionTitle
+                ?: snapshot.sessions.firstOrNull { it.id == task.sessionId }?.title
+                ?: "新对话"
+            val taskInfo = GenerationTaskInfo(
+                id = task.id,
+                sessionId = task.sessionId,
+                sessionTitle = sessionTitle,
+                userMessageId = task.userMessageId,
+                providerId = task.providerId,
+                providerKind = task.providerKind,
+                providerName = task.providerName,
+                modelId = task.modelId,
+                modelName = task.modelName,
+                reasoningLevel = task.reasoningLevel,
+                state = task.state,
+                assistantText = task.assistantText,
+                reasoningSummary = task.reasoningSummary,
+                startedAt = task.startedAt,
+                completedAt = task.completedAt,
+                errorMessage = task.errorMessage,
+                outputTokenCount = task.outputTokenCount,
+                outputTokensPerSecond = task.outputTokensPerSecond,
+                tokenRateEstimated = task.tokenRateEstimated,
+            )
+            val tasks = if (existing == null) {
+                snapshot.tasks + taskInfo
+            } else {
+                snapshot.tasks.map { current -> if (current.id == task.id) taskInfo else current }
+            }
+            mutableSnapshot.value = snapshot.copy(tasks = tasks)
+        }
+    }
+
+    /** 按提交顺序启动排队任务，允许同一会话的请求并发执行。 */
     private fun scheduleQueuedTasks() {
         synchronized(snapshotLock) {
             val tasks = dataStore.getTasks()
             val active = tasks.filter { it.state == GenerationState.CONNECTING || it.state == GenerationState.STREAMING }
             active.forEach { activeTaskIds.add(it.id) }
-            val occupiedSessions = tasks.filter { task -> task.id in activeTaskIds }.mapTo(linkedSetOf()) { it.sessionId }
             while (activeTaskIds.size < MAX_CONCURRENT_TASKS) {
-                val next = tasks.firstOrNull { it.state == GenerationState.QUEUED && it.id !in activeTaskIds && it.sessionId !in occupiedSessions }
+                val next = tasks.firstOrNull { it.state == GenerationState.QUEUED && it.id !in activeTaskIds }
                     ?: break
                 activeTaskIds.add(next.id)
-                occupiedSessions.add(next.sessionId)
                 try {
                     ChatGenerationService.startTask(context, next.id)
                 } catch (exception: Exception) {
@@ -464,14 +574,104 @@ class ChatRepository(private val context: Context) {
                     startedAt = task.startedAt,
                     completedAt = task.completedAt,
                     errorMessage = task.errorMessage,
+                    outputTokenCount = task.outputTokenCount,
+                    outputTokensPerSecond = task.outputTokensPerSecond,
+                    tokenRateEstimated = task.tokenRateEstimated,
                 )
             },
             preferences = dataStore.getPreferences(),
+            appearanceSettings = dataStore.getAppearanceSettings(),
         )
     }
 
+    /** 在独立协程中安排摘要生成，避免延迟聊天回答的完成通知。 */
+    private fun scheduleSessionSummary(task: GenerationTask) {
+        if (task.state != GenerationState.COMPLETED || task.assistantText.isBlank()) return
+        val sessionMutex = summaryMutexes.computeIfAbsent(task.sessionId) { Mutex() }
+        backgroundScope.launch {
+            sessionMutex.withLock {
+                updateSessionSummary(task)
+            }
+        }
+    }
+
+    /** 在本机完成发送确认后生成文本摘要，并丢弃过期的并发结果。 */
+    private suspend fun updateSessionSummary(task: GenerationTask) {
+        if (!dataStore.hasConfirmedMessageTransfer()) return
+        val currentConnection = dataStore.getConnection(task.providerId) ?: return
+        if (currentConnection.baseUrl != task.baseUrl || currentConnection.apiKey != task.apiKey) return
+
+        val completedTaskIds = dataStore.getTasks()
+            .filter { it.sessionId == task.sessionId && it.state == GenerationState.COMPLETED }
+            .mapTo(hashSetOf(), GenerationTask::id)
+        val completedMessages = dataStore.getMessages(task.sessionId)
+            .filter { it.taskId in completedTaskIds }
+        val latestAssistantMessageId = completedMessages.lastOrNull { it.role == MessageRole.ASSISTANT }?.id ?: return
+        val prompt = buildConversationSummaryPrompt(completedMessages) ?: return
+        val summaryTask = task.copy(
+            id = "summary-${UUID.randomUUID()}",
+            assistantMessageId = "summary-${UUID.randomUUID()}",
+            supportsImages = false,
+            assistantText = "",
+            reasoningSummary = null,
+            outputTokenCount = 0,
+            outputTokensPerSecond = null,
+            tokenRateEstimated = false,
+        )
+        val summaryOutput = StringBuilder()
+        try {
+            val coroutineContext = currentCoroutineContext()
+            providerApi.streamChat(
+                task = summaryTask,
+                history = listOf(
+                    ChatMessage(
+                        id = summaryTask.userMessageId,
+                        sessionId = task.sessionId,
+                        role = MessageRole.USER,
+                        text = prompt,
+                        createdAt = System.currentTimeMillis(),
+                    ),
+                ),
+                onText = { delta ->
+                    if (summaryOutput.length < SUMMARY_OUTPUT_CHAR_LIMIT) {
+                        summaryOutput.append(delta.take(SUMMARY_OUTPUT_CHAR_LIMIT - summaryOutput.length))
+                    }
+                },
+                onReasoningSummary = {},
+                isCancelled = { !coroutineContext.isActive },
+            )
+            val summary = normalizeConversationSummary(summaryOutput.toString())
+            if (summary.isBlank()) return
+
+            val newestAssistantMessageId = latestCompletedAssistantMessageId(task.sessionId)
+            if (shouldApplyConversationSummary(latestAssistantMessageId, newestAssistantMessageId, summary)) {
+                dataStore.saveSessionSummary(task.sessionId, summary)
+                publishSnapshot()
+            }
+        } catch (exception: CancellationException) {
+            throw exception
+        } catch (exception: Exception) {
+            Log.w(TAG, "自动摘要失败，保留最近消息预览。")
+        }
+    }
+
+    /** 读取会话当前最新的已完成回答标识，用于阻止旧摘要覆盖新内容。 */
+    private fun latestCompletedAssistantMessageId(sessionId: String): String? {
+        val completedTaskIds = dataStore.getTasks()
+            .filter { it.sessionId == sessionId && it.state == GenerationState.COMPLETED }
+            .mapTo(hashSetOf(), GenerationTask::id)
+        return dataStore.getMessages(sessionId)
+            .lastOrNull { it.role == MessageRole.ASSISTANT && it.taskId in completedTaskIds }
+            ?.id
+    }
+
     private companion object {
+        const val TAG = "ChatRepository"
         const val MAX_CONCURRENT_TASKS = 3
+        const val STREAM_PERSIST_INTERVAL_MS = 500L
+        const val STREAM_SNAPSHOT_INTERVAL_MS = 50L
+        const val STREAM_SNAPSHOT_CHAR_THRESHOLD = 32
+        const val TOKEN_RATE_UPDATE_INTERVAL_MS = 1000L
         const val MAX_TITLE_LENGTH = 56
         const val MAX_ERROR_LENGTH = 320
     }

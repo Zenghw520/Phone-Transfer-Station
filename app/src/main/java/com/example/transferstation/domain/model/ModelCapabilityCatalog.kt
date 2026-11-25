@@ -21,7 +21,7 @@ object ModelCapabilityCatalog {
             else -> normalized.contains("vision") || normalized.contains("-vl")
         }
         val reasoning = when {
-            provider in setOf(ProviderKind.OPENAI, ProviderKind.CUSTOM) && isOpenAiReasoningModel(normalized) -> listOf("低", "中", "高")
+            provider in setOf(ProviderKind.OPENAI, ProviderKind.CUSTOM) && isOpenAiReasoningModel(normalized) -> openAiReasoningLevels(normalized)
             provider == ProviderKind.DEEPSEEK && (normalized.contains("reasoner") || normalized.contains("r1")) -> listOf("低", "中", "高")
             provider == ProviderKind.GEMINI && (normalized.contains("gemini-2.5") || normalized.contains("gemini-3")) -> listOf("低", "中", "高")
             provider == ProviderKind.ANTHROPIC && (normalized.contains("claude-sonnet-4-5") || normalized.contains("claude-sonnet-4-6") || normalized.contains("claude-opus-4-5") || normalized.contains("claude-opus-4-6")) -> listOf("低", "中", "高")
@@ -54,4 +54,12 @@ object ModelCapabilityCatalog {
     private fun isOpenAiReasoningModel(normalizedModelId: String): Boolean =
         normalizedModelId.startsWith("gpt-5") || normalizedModelId.startsWith("o1") ||
             normalizedModelId.startsWith("o3") || normalizedModelId.startsWith("o4")
+
+    /** 按已知 OpenAI 模型系列返回接口支持的 Codex 风格思考档位。 */
+    private fun openAiReasoningLevels(normalizedModelId: String): List<String> = when {
+        normalizedModelId.startsWith("gpt-5.1") || normalizedModelId.startsWith("gpt-5.2") ->
+            listOf("minimal", "low", "medium", "high", "xhigh")
+        normalizedModelId.startsWith("gpt-5") -> listOf("minimal", "low", "medium", "high")
+        else -> listOf("low", "medium", "high")
+    }
 }

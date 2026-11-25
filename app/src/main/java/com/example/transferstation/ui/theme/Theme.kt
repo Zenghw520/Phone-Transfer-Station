@@ -1,14 +1,103 @@
 package com.example.transferstation.ui.theme
 
+import android.app.Activity
+import android.os.Build
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.dynamicDarkColorScheme
+import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.unit.Density
 import androidx.core.view.WindowCompat
+import com.example.transferstation.domain.model.AppearanceSettings
+
+/** 当前界面使用的持久化外观配置。 */
+val LocalAppearanceSettings = staticCompositionLocalOf { AppearanceSettings() }
+
+/** 套用系统深浅主题、Monet 配色、自定义强调色和全局页面缩放。 */
+@Composable
+fun TransferStationTheme(
+    appearance: AppearanceSettings = AppearanceSettings(),
+    content: @Composable () -> Unit,
+) {
+    val isDarkTheme = when (appearance.themeMode) {
+        "dark" -> true
+        "light" -> false
+        else -> isSystemInDarkTheme()
+    }
+    val context = LocalContext.current
+    val baseColorScheme = if (appearance.monetColorEnabled && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        if (isDarkTheme) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
+    } else {
+        if (isDarkTheme) ChatDarkColors else ChatLightColors
+    }
+    val colorScheme = if (appearance.monetColorEnabled && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        baseColorScheme
+    } else {
+        baseColorScheme.withAccent(parseAccentColor(appearance.accentColorHex), isDarkTheme)
+    }.let { scheme ->
+        if (appearance.liquidGlassEnabled) {
+            scheme.copy(
+                background = scheme.background.copy(alpha = 0.90f),
+                surface = scheme.surface.copy(alpha = 0.82f),
+                surfaceVariant = scheme.surfaceVariant.copy(alpha = 0.74f),
+            )
+        } else {
+            scheme
+        }
+    }
+    val view = LocalView.current
+    val density = LocalDensity.current
+    val scale = appearance.scaleFactor.coerceIn(MIN_PAGE_SCALE, MAX_PAGE_SCALE)
+    if (!view.isInEditMode) {
+        SideEffect {
+            val window = (view.context as? Activity)?.window ?: return@SideEffect
+            val bars = WindowCompat.getInsetsController(window, view)
+            bars.isAppearanceLightStatusBars = !isDarkTheme
+            bars.isAppearanceLightNavigationBars = !isDarkTheme
+        }
+    }
+    CompositionLocalProvider(
+        LocalAppearanceSettings provides appearance,
+        LocalDensity provides Density(
+            density = density.density * scale,
+            fontScale = density.fontScale * scale,
+        ),
+    ) {
+        MaterialTheme(
+            colorScheme = colorScheme,
+            typography = Typography,
+            content = content,
+        )
+    }
+}
+
+/** 解析六位十六进制强调色，遇到旧值或无效输入时沿用默认蓝色。 */
+private fun parseAccentColor(value: String): Color = runCatching {
+    Color(android.graphics.Color.parseColor(value))
+}.getOrDefault(Color(0xFF315FBA))
+
+/** 将用户强调色应用到基础浅色或深色 Material 色板。 */
+private fun androidx.compose.material3.ColorScheme.withAccent(accent: Color, isDark: Boolean) = copy(
+    primary = accent,
+    onPrimary = if (accent.luminance() > 0.52f) Color.Black else Color.White,
+    primaryContainer = accent.copy(alpha = if (isDark) 0.30f else 0.16f),
+    onPrimaryContainer = if (isDark) Color.White else accent,
+    secondary = accent,
+)
+
+private const val MIN_PAGE_SCALE = 0.8f
+private const val MAX_PAGE_SCALE = 1.2f
 
 /** 套用轻量、简洁的深色 AI 聊天主题。 */
 private val ChatDarkColors = darkColorScheme(
@@ -43,27 +132,3 @@ private val ChatLightColors = lightColorScheme(
     outline = Color(0xFFD7D9DE),
     error = Color(0xFFBA1A1A),
 )
-
-/** 根据设置主题和 Android 当前主题应用 Chat Material 配色。 */
-@Composable
-fun TransferStationTheme(themeMode: String = "system", content: @Composable () -> Unit) {
-    val useDarkTheme = when (themeMode) {
-        "dark" -> true
-        "light" -> false
-        else -> isSystemInDarkTheme()
-    }
-    val view = LocalView.current
-    if (!view.isInEditMode) {
-        SideEffect {
-            val window = (view.context as android.app.Activity).window
-            val bars = WindowCompat.getInsetsController(window, view)
-            bars.isAppearanceLightStatusBars = !useDarkTheme
-            bars.isAppearanceLightNavigationBars = !useDarkTheme
-        }
-    }
-    MaterialTheme(
-        colorScheme = if (useDarkTheme) ChatDarkColors else ChatLightColors,
-        typography = Typography,
-        content = content,
-    )
-}

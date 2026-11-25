@@ -11,6 +11,7 @@ import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -34,6 +35,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsPadding
@@ -53,6 +55,8 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Divider
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.compose.material3.DrawerState
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.DropdownMenu
@@ -96,6 +100,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.platform.LocalContext
@@ -126,6 +132,7 @@ import coil.request.ImageRequest
 import com.example.transferstation.R
 import com.example.transferstation.domain.model.ChatMessage
 import com.example.transferstation.domain.model.ChatSession
+import com.example.transferstation.domain.model.AppearanceSettings
 import com.example.transferstation.domain.model.GenerationState
 import com.example.transferstation.domain.model.GenerationTaskInfo
 import com.example.transferstation.domain.model.MessageRole
@@ -139,6 +146,8 @@ import com.example.transferstation.domain.model.ProviderKind
 import com.example.transferstation.presentation.ChatUiState
 import com.example.transferstation.presentation.ChatViewModel
 import com.example.transferstation.ui.theme.TransferStationTheme
+import com.example.transferstation.ui.theme.LiquidGlassHost
+import com.example.transferstation.ui.theme.LiquidGlassSurface
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 import java.io.File
@@ -146,7 +155,17 @@ import java.text.DateFormat
 import java.util.Date
 import java.util.Locale
 
-/** 连接历史抽屉、聊天列表、服务商设置及 Android 图片选择器，并维护页面交互状态。 */
+/** 关联待确认草稿与当前会话、服务商、模型及实际传输范围。 */
+private data class SendConfirmation(
+    val sessionId: String,
+    val text: String,
+    val connection: ProviderConnectionInfo,
+    val modelId: String,
+    val requiresTransferConfirmation: Boolean,
+    val omitHistoryImages: Boolean,
+)
+
+/** 连接历史抽屉、聊天列表、首次发送确认、模型选择和 Android 图片选择器。 */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatScreen(
@@ -168,9 +187,9 @@ fun ChatScreen(
     val scope = rememberCoroutineScope()
     var showSettings by remember { mutableStateOf(false) }
     var showModelPicker by remember { mutableStateOf(false) }
+    var showFullScreenEditor by rememberSaveable { mutableStateOf(false) }
     var showAddProvider by remember { mutableStateOf(false) }
-    var showTransferConsent by remember { mutableStateOf<String?>(null) }
-    var sendConfirmation by remember { mutableStateOf<Triple<String, String, Boolean>?>(null) }
+    var sendConfirmation by remember { mutableStateOf<SendConfirmation?>(null) }
     var unsupportedImageDraft by remember { mutableStateOf(false) }
     var imageSourceSheet by remember { mutableStateOf(false) }
     var editingProviderId by remember { mutableStateOf<String?>(null) }
@@ -232,6 +251,45 @@ fun ChatScreen(
         it.state == GenerationState.CONNECTING || it.state == GenerationState.STREAMING || it.state == GenerationState.QUEUED
     }
 
+    val canSend = state.openSessionId != null && connection != null && selectedModel != null &&
+        !state.isBusy && !state.isLoadingMessages && !state.isSendingMessage &&
+        (composerText.isNotBlank() || pendingAttachments.isNotEmpty())
+
+    /** 提交已确定传输范围的草稿并清理输入框。 */
+    fun submitDraft(sessionId: String, text: String, omitHistoryImages: Boolean, transferConfirmed: Boolean) {
+        viewModel.send(text, sessionId, omitHistoryImages, transferConfirmed)
+        requestNotificationPermissionIfNeeded(context, notificationPermission, hasRequestedNotificationPermission)
+        composerText = ""
+        providersToAdd.clear()
+    }
+
+    val sendDraft = sendDraft@{
+        if (!canSend || sendConfirmation != null) return@sendDraft
+        val sessionId = state.openSessionId ?: return@sendDraft
+        if (pendingAttachments.isNotEmpty() && !selectedModel.supportsImages) {
+            unsupportedImageDraft = true
+            return@sendDraft
+        }
+        val requiresTransferConfirmation = !snapshot.preferences.hasConfirmedMessageTransfer
+        val omitHistoryImages = !selectedModel.supportsImages && state.messages.any { it.imagePaths.isNotEmpty() }
+        showFullScreenEditor = false
+        if (requiresTransferConfirmation || omitHistoryImages) {
+            sendConfirmation = SendConfirmation(
+                sessionId,
+                composerText,
+                connection,
+                selectedModel.id,
+                requiresTransferConfirmation,
+                omitHistoryImages,
+            )
+        } else {
+            submitDraft(sessionId, composerText, omitHistoryImages = false, transferConfirmed = false)
+        }
+    }
+
+    BackHandler(enabled = showFullScreenEditor) { showFullScreenEditor = false }
+
+    LiquidGlassHost {
     ModalNavigationDrawer(
         modifier = modifier.fillMaxSize(),
         drawerState = drawerState,
@@ -253,7 +311,7 @@ fun ChatScreen(
             contentWindowInsets = WindowInsets(0.dp, 0.dp, 0.dp, 0.dp),
             topBar = {
                 ChatTopBar(
-                    title = currentSession?.title ?: "多模型 AI",
+                    title = currentSession?.title ?: stringResource(R.string.app_name),
                     runningCount = runningCount,
                     drawerState = drawerState,
                     onCloseDrawer = { scope.launch { drawerState.close() } },
@@ -272,7 +330,7 @@ fun ChatScreen(
                     selectedProvider = connection,
                     selectedModel = selectedModel,
                     reasoningLevel = state.reasoningLevel,
-                    canSend = connection != null && selectedModel != null && !state.isBusy && (composerText.isNotBlank() || pendingAttachments.isNotEmpty()),
+                    canSend = canSend,
                     onTextChanged = { composerText = it },
                     onAttach = { imageSourceSheet = true },
                     onReasoning = viewModel::selectReasoningLevel,
@@ -280,27 +338,17 @@ fun ChatScreen(
                         providersToAdd.removeAt(index).also(viewModel::discardAttachment)
                         viewModel.setPendingAttachments(providersToAdd.toList())
                     },
-                    onSend = {
-                        val sessionId = state.openSessionId ?: return@ChatComposer
-                        val providerId = connection?.id ?: return@ChatComposer
-                        val chosenModel = selectedModel ?: return@ChatComposer
-                        if (pendingAttachments.isNotEmpty() && !chosenModel.supportsImages) {
-                            unsupportedImageDraft = true
-                            return@ChatComposer
-                        }
-                        val missingConsent = providerId !in snapshot.preferences.confirmedProviderIds
-                        val historyHasImages = state.messages.any { it.imagePaths.isNotEmpty() }
-                        if (missingConsent) showTransferConsent = providerId
-                        else if (!chosenModel.supportsImages && historyHasImages) sendConfirmation = Triple(sessionId, composerText, true)
-                        else sendConfirmation = Triple(sessionId, composerText, false)
-                    },
+                    onSend = sendDraft,
                     onModel = { showModelPicker = true },
+                    onExpand = { showFullScreenEditor = true },
                 )
             },
             containerColor = MaterialTheme.colorScheme.background,
             modifier = Modifier,
         ) { innerPadding ->
-            Column(Modifier.fillMaxSize().padding(innerPadding)) {
+            Column(
+                Modifier.fillMaxSize().padding(top = innerPadding.calculateTopPadding()),
+            ) {
                 if (connection == null) {
                     SetupWelcomeCard(
                         configuredProviders = snapshot.connections.size,
@@ -326,6 +374,7 @@ fun ChatScreen(
                             messages = state.messages,
                             tasksById = tasksById,
                             modifier = Modifier.weight(1f),
+                            bottomContentPadding = innerPadding.calculateBottomPadding() + 18.dp,
                             onRetry = viewModel::retry,
                             onStop = viewModel::stop,
                         )
@@ -350,14 +399,30 @@ fun ChatScreen(
     }
 
     if (showSettings) {
-        ProviderSettingsSheet(
+        SettingsScreen(
             state = state,
             onAddConnection = { showAddProvider = true },
             onEditConnection = { id -> showAddProvider = true; editingProviderId = id },
             onDeleteConnection = { connectionInfo -> connectionToDelete = connectionInfo },
             onRefreshModels = { id, onComplete -> viewModel.refreshModels(id, onComplete) },
-            onThemeSelected = viewModel::setTheme,
+            appearance = snapshot.appearanceSettings,
+            onAppearanceChanged = viewModel::setAppearanceSettings,
             onClose = { showSettings = false },
+        )
+    }
+
+    if (showFullScreenEditor) {
+        FullscreenComposerDialog(
+            text = composerText,
+            attachments = pendingAttachments,
+            canSend = canSend,
+            onTextChanged = { composerText = it },
+            onRemoveAttachment = { index ->
+                providersToAdd.removeAt(index).also(viewModel::discardAttachment)
+                viewModel.setPendingAttachments(providersToAdd.toList())
+            },
+            onSend = sendDraft,
+            onDismiss = { showFullScreenEditor = false },
         )
     }
 
@@ -408,52 +473,40 @@ fun ChatScreen(
         )
     }
 
-    val activeSendConfirmation = sendConfirmation
-    if (activeSendConfirmation != null) {
-        val activeConnection = snapshot.connections.firstOrNull { it.id == state.selectedProviderId }
-        val pendingOnlySendText = activeSendConfirmation.third
+    val confirmation = sendConfirmation
+    if (confirmation != null) {
+        val explanation = buildList {
+            if (confirmation.requiresTransferConfirmation) {
+                val destination = confirmation.connection
+                add("本应用在你的手机上保存会话和 API 配置。发送后，你的对话内容及模型支持的图片会直接传输至所选服务商处理。当前服务商为 ${destination.connectionDisplayName()}。")
+                if (destination.kind == ProviderKind.CUSTOM) add("接口地址：${destination.baseUrl}")
+                add("以后发送消息时将直接使用当前选中的模型及 API。")
+            }
+            if (confirmation.omitHistoryImages) {
+                add("当前模型只支持文字输入。本次请求会跳过历史图片，原图仍可在聊天记录中查看。")
+            }
+        }.joinToString("\n\n")
         AlertDialog(
             onDismissRequest = { sendConfirmation = null },
-            title = { Text(if (pendingOnlySendText) "跳过历史图片？" else "发送消息？") },
-            text = { Text(if (pendingOnlySendText) "当前模型只支持文字输入。本次请求会排除本会话中的图片，聊天记录中的原图仍可查看。" else "本次对话及附件会发送至 ${activeConnection?.connectionDisplayName() ?: "当前服务商"}，用于生成回答。") },
+            title = { Text(if (confirmation.requiresTransferConfirmation) "发送消息？" else "跳过历史图片？") },
+            text = { Text(explanation) },
             confirmButton = {
                 TextButton(onClick = {
                     sendConfirmation = null
-                    if (activeConnection?.id !in snapshot.preferences.confirmedProviderIds) activeConnection?.id?.let(viewModel::confirmProviderTransfer)
-                    viewModel.send(activeSendConfirmation.second, activeSendConfirmation.first, pendingOnlySendText)
-                    requestNotificationPermissionIfNeeded(context, notificationPermission, hasRequestedNotificationPermission)
-                    composerText = ""
-                    providersToAdd.clear()
-                }) { Text("继续发送") }
+                    if (state.openSessionId == confirmation.sessionId &&
+                        connection == confirmation.connection &&
+                        selectedModel?.id == confirmation.modelId
+                    ) {
+                        submitDraft(
+                            confirmation.sessionId,
+                            confirmation.text,
+                            confirmation.omitHistoryImages,
+                            confirmation.requiresTransferConfirmation,
+                        )
+                    }
+                }) { Text(if (confirmation.requiresTransferConfirmation) "了解并继续" else "继续发送") }
             },
             dismissButton = { TextButton(onClick = { sendConfirmation = null }) { Text("取消") } },
-        )
-    }
-
-    val consentProviderId = showTransferConsent
-    if (consentProviderId != null) {
-        val consentProvider = snapshot.connections.firstOrNull { it.id == consentProviderId }
-        AlertDialog(
-            onDismissRequest = { showTransferConsent = null },
-            title = { Text("发送内容至 ${consentProvider?.connectionDisplayName() ?: "服务商"}？") },
-            text = { Text("本应用在你的手机上保存会话和 API 配置。发送后，你的消息和所选图片会直接传输至该模型服务商处理。${consentProvider?.baseUrl?.takeIf { consentProvider.kind == ProviderKind.CUSTOM }?.let { "\n\n接口地址：$it" }.orEmpty()}") },
-            confirmButton = {
-                TextButton(onClick = {
-                    showTransferConsent = null
-                    viewModel.confirmProviderTransfer(consentProviderId)
-                    val selectedModel = selectedModel ?: return@TextButton
-                    val sessionId = state.openSessionId ?: return@TextButton
-                    val omitImages = !selectedModel.supportsImages && state.messages.any { it.imagePaths.isNotEmpty() }
-                    if (omitImages) sendConfirmation = Triple(sessionId, composerText, true)
-                    else {
-                        viewModel.send(composerText, sessionId, false)
-                        requestNotificationPermissionIfNeeded(context, notificationPermission, hasRequestedNotificationPermission)
-                        composerText = ""
-                        providersToAdd.clear()
-                    }
-                }) { Text("了解并继续") }
-            },
-            dismissButton = { TextButton(onClick = { showTransferConsent = null }) { Text("取消") } },
         )
     }
 
@@ -489,6 +542,7 @@ fun ChatScreen(
             confirmButton = { TextButton(onClick = { notificationPermissionNeedsSettings = false; openAppNotificationSettings(context) }) { Text("管理通知") } },
             dismissButton = { TextButton(onClick = { notificationPermissionNeedsSettings = false }) { Text("知道了") } },
         )
+    }
     }
 }
 
@@ -536,7 +590,7 @@ private fun ChatTopBar(
     BackHandler(enabled = !drawerState.isClosed) { onCloseDrawer() }
 }
 
-/** 在状态栏下方显示本机历史、会话操作和账户设置入口。 */
+/** 在状态栏下方显示本机历史、AI 摘要预览、会话操作和设置入口。 */
 @Composable
 private fun SessionDrawer(
     drawerState: DrawerState,
@@ -593,6 +647,9 @@ private fun SessionDrawer(
                     ) {
                         Column(Modifier.weight(1f)) {
                             Text(session.title, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = if (session.id == currentSessionId) FontWeight.SemiBold else FontWeight.Normal, fontSize = 14.sp)
+                            session.summary?.takeIf(String::isNotBlank)?.let { summary ->
+                                Text(summary, maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
                             Text(sessionTaskState?.displayLabel() ?: session.updatedAt.displayTimestamp(), fontSize = 11.sp, color = if (sessionTaskState in setOf(GenerationState.FAILED, GenerationState.INTERRUPTED)) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                         Box {
@@ -633,7 +690,7 @@ private fun SessionDrawer(
 
 /** 渲染顶部服务商和模型胶囊、思考选项及独立附件操作。 */
 @Composable
-private fun ChatComposer(
+internal fun ChatComposer(
     text: String,
     attachments: List<PendingAttachment>,
     selectedProvider: ProviderConnectionInfo?,
@@ -646,21 +703,23 @@ private fun ChatComposer(
     onRemoveAttachment: (Int) -> Unit,
     onSend: () -> Unit,
     onModel: () -> Unit,
+    onExpand: () -> Unit,
 ) {
     var expandedReasoning by remember { mutableStateOf(false) }
+    var visualLineCount by remember { mutableStateOf(1) }
     val messagePlaceholder = selectedModel?.let { model ->
         val providerLabel = ModelProviderCatalog.identify(selectedProvider?.kind, model.id, model.name)?.brand
             ?: selectedProvider?.kind?.displayName
             ?: "模型"
         stringResource(R.string.chat_message_placeholder_with_model, providerLabel)
     } ?: stringResource(R.string.chat_message_placeholder)
-    Surface(
+    LiquidGlassSurface(
         color = MaterialTheme.colorScheme.background,
-        tonalElevation = 3.dp,
         modifier = Modifier.fillMaxWidth().navigationBarsPadding().imePadding().padding(horizontal = 13.dp, vertical = 7.dp),
         shape = RoundedCornerShape(25.dp),
         shadowElevation = 5.dp,
         border = androidx.compose.foundation.BorderStroke(0.8.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.57f)),
+        isInput = true,
     ) {
         Column(Modifier.padding(horizontal = 13.dp, vertical = 11.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
             if (attachments.isNotEmpty()) {
@@ -688,11 +747,18 @@ private fun ChatComposer(
                     BasicTextField(
                         value = text,
                         onValueChange = onTextChanged,
-                        modifier = Modifier.fillMaxWidth().heightIn(min = 34.dp, max = 138.dp),
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp, max = 184.dp)
+                            .semantics { contentDescription = "消息输入框" },
                         cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
                         textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface, fontSize = 16.sp),
                         keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences, keyboardType = KeyboardType.Text),
+                        onTextLayout = { visualLineCount = it.lineCount },
                     )
+                }
+                if (shouldShowComposerExpandIcon(visualLineCount)) {
+                    IconButton(onClick = onExpand, modifier = Modifier.size(38.dp).semantics { contentDescription = "全屏展开输入框" }) {
+                        Text("⤢", fontSize = 21.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
                 }
                 FilledIconButton(
                     onClick = onSend,
@@ -713,10 +779,10 @@ private fun ChatComposer(
                 )
                 if (selectedModel?.reasoningLevels?.isNotEmpty() == true) {
                     Box {
-                        CompactChip(label = reasoningLevel?.let { "$it 思考" } ?: "思考强度", enabled = true, onClick = { expandedReasoning = true })
+                        CompactChip(label = reasoningLevel?.let { "${reasoningLevelLabel(it)} 思考" } ?: "思考强度", enabled = true, onClick = { expandedReasoning = true })
                         DropdownMenu(expanded = expandedReasoning, onDismissRequest = { expandedReasoning = false }) {
                             DropdownMenuItem(text = { Text("默认") }, onClick = { onReasoning(null); expandedReasoning = false })
-                            selectedModel.reasoningLevels.forEach { level -> DropdownMenuItem(text = { Text(level) }, onClick = { onReasoning(level); expandedReasoning = false }) }
+                            selectedModel.reasoningLevels.forEach { level -> DropdownMenuItem(text = { Text(reasoningLevelLabel(level)) }, onClick = { onReasoning(level); expandedReasoning = false }) }
                         }
                     }
                 }
@@ -731,12 +797,71 @@ private fun ChatComposer(
     }
 }
 
+/** 全屏编辑长消息并沿用聊天页的附件草稿、删除和发送操作。 */
+@Composable
+private fun FullscreenComposerDialog(
+    text: String,
+    attachments: List<PendingAttachment>,
+    canSend: Boolean,
+    onTextChanged: (String) -> Unit,
+    onRemoveAttachment: (Int) -> Unit,
+    onSend: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+            Column(
+                Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().imePadding()
+                    .padding(horizontal = 18.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text("编辑消息", Modifier.weight(1f), style = MaterialTheme.typography.titleLarge)
+                    TextButton(onClick = onDismiss) { Text("收起") }
+                }
+                if (attachments.isNotEmpty()) {
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        attachments.forEachIndexed { index, attachment ->
+                            Box {
+                                AsyncImage(
+                                    model = ImageRequest.Builder(LocalContext.current).data(File(attachment.localPath)).crossfade(true).build(),
+                                    contentDescription = "待发送图片 ${index + 1}",
+                                    modifier = Modifier.size(76.dp).clip(RoundedCornerShape(16.dp)),
+                                )
+                                IconButton(
+                                    onClick = { onRemoveAttachment(index) },
+                                    modifier = Modifier.align(Alignment.TopEnd).size(28.dp),
+                                ) { Text("×", color = Color.White) }
+                            }
+                        }
+                    }
+                }
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = onTextChanged,
+                    modifier = Modifier.weight(1f).fillMaxWidth(),
+                    placeholder = { Text("输入消息") },
+                    textStyle = MaterialTheme.typography.bodyLarge.copy(fontSize = 17.sp, lineHeight = 27.sp),
+                    keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences, keyboardType = KeyboardType.Text),
+                )
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                    Button(onClick = onSend, enabled = canSend, shape = RoundedCornerShape(18.dp)) { Text("发送") }
+                }
+            }
+        }
+    }
+}
+
 /**
  * 使用稳定消息键渲染历史消息，并在用户停留底部时节流处理流式滚动。
  *
  * @param messages 当前会话消息。
  * @param tasksById 后台生成任务快照。
  * @param modifier 消息列表布局修饰符。
+ * @param bottomContentPadding 为底部输入栏预留的滚动空间。
  * @param onRetry 重试失败生成任务。
  * @param onStop 停止生成任务。
  */
@@ -745,6 +870,7 @@ private fun ConversationMessages(
     messages: List<ChatMessage>,
     tasksById: Map<String, GenerationTaskInfo>,
     modifier: Modifier = Modifier,
+    bottomContentPadding: Dp = 18.dp,
     onRetry: (String) -> Unit,
     onStop: (String) -> Unit,
 ) {
@@ -783,7 +909,12 @@ private fun ConversationMessages(
     LazyColumn(
         state = messagesState,
         modifier = modifier.fillMaxWidth(),
-        contentPadding = PaddingValues(horizontal = 18.dp, vertical = 18.dp),
+        contentPadding = PaddingValues(
+            start = 18.dp,
+            top = 18.dp,
+            end = 18.dp,
+            bottom = bottomContentPadding,
+        ),
         verticalArrangement = Arrangement.spacedBy(22.dp),
     ) {
         items(messages, key = ChatMessage::id) { message ->
@@ -791,6 +922,8 @@ private fun ConversationMessages(
             MessageRow(
                 message = message,
                 taskText = task?.assistantText.orEmpty(),
+                taskTokensPerSecond = task?.outputTokensPerSecond,
+                tokenRateEstimated = task?.tokenRateEstimated ?: false,
                 taskReasoningSummary = task?.reasoningSummary,
                 taskState = task?.state,
                 taskError = task?.errorMessage,
@@ -806,12 +939,17 @@ private fun ConversationMessages(
 
 private const val STREAM_SCROLL_INTERVAL_MS = 48L
 
-/** 显示一条用户或 AI 消息、模型元数据、任务状态和已保存的图片。 */
+/** 当输入框超过三行可见文本时显示全屏展开入口。 */
+internal fun shouldShowComposerExpandIcon(visualLineCount: Int): Boolean = visualLineCount > 3
+
+/** 显示消息气泡、模型版本、任务速度和已保存的图片。 */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun MessageRow(
     message: ChatMessage,
     taskText: String,
+    taskTokensPerSecond: Double?,
+    tokenRateEstimated: Boolean,
     taskReasoningSummary: String?,
     taskState: GenerationState?,
     taskError: String?,
@@ -861,23 +999,36 @@ private fun MessageRow(
                 }
                 if (displayText.isNotEmpty() || taskState != null) {
                     if (isUser) {
-                        Surface(shape = RoundedCornerShape(topStart = 22.dp, topEnd = 7.dp, bottomEnd = 22.dp, bottomStart = 22.dp), color = MaterialTheme.colorScheme.surfaceVariant) {
+                        LiquidGlassSurface(
+                            shape = RoundedCornerShape(topStart = 22.dp, topEnd = 7.dp, bottomEnd = 22.dp, bottomStart = 22.dp),
+                            color = MaterialTheme.colorScheme.surfaceVariant,
+                        ) {
                             SelectionContainer { Text(displayText, modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp), fontSize = 15.sp, lineHeight = 24.sp) }
                         }
                     } else {
                         Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(9.dp)) {
-                            if (displayText.isNotEmpty()) SelectionContainer {
-                                Text(
-                                    text = richText(displayText),
-                                    fontSize = 15.sp,
-                                    lineHeight = 25.sp,
-                                    color = MaterialTheme.colorScheme.onBackground,
-                                )
+                            if (displayText.isNotEmpty()) {
+                                LiquidGlassSurface(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    shape = RoundedCornerShape(20.dp),
+                                    color = MaterialTheme.colorScheme.surfaceVariant,
+                                ) {
+                                    SelectionContainer {
+                                        Box(Modifier.padding(horizontal = 15.dp, vertical = 12.dp)) {
+                                            SolutionFlow(displayText)
+                                        }
+                                    }
+                                }
                             }
-                            if (taskState == GenerationState.STREAMING || taskState == GenerationState.CONNECTING || taskState == GenerationState.QUEUED) {
+                            if (taskState in setOf(GenerationState.STREAMING, GenerationState.CONNECTING, GenerationState.QUEUED, GenerationState.COMPLETED)) {
                                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    if (taskState != GenerationState.QUEUED) CircularProgressIndicator(Modifier.size(15.dp), strokeWidth = 2.dp)
-                                    Text(taskState?.displayLabel().orEmpty() + if (taskStartedAt != null) " · ${elapsedLabel(taskStartedAt, elapsedNow)}" else "", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    if (taskState in setOf(GenerationState.CONNECTING, GenerationState.STREAMING)) CircularProgressIndicator(Modifier.size(15.dp), strokeWidth = 2.dp)
+                                    val elapsed = if (taskState != GenerationState.COMPLETED && taskStartedAt != null) " · ${elapsedLabel(taskStartedAt, elapsedNow)}" else ""
+                                    Text(taskState?.displayLabel().orEmpty() + elapsed, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    if (taskState == GenerationState.STREAMING && taskTokensPerSecond != null) {
+                                        val prefix = if (tokenRateEstimated) "≈" else ""
+                                        Text("$prefix${String.format(currentLocale, "%.1f", taskTokensPerSecond)} tokens/s", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    }
                                     onStop?.let { TextButton(onClick = it) { Text("停止", fontSize = 12.sp) } }
                                 }
                             }
@@ -904,8 +1055,8 @@ private fun MessageRow(
                             }
                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                                 ProviderLogo(providerKind, modelProvider?.brand ?: message.providerName.connectionDisplayName() ?: "模型", 13.dp, message.modelName, message.modelName)
-                                Text("${modelProvider?.brand ?: message.providerName.connectionDisplayName() ?: "模型"} · ${message.modelName ?: "AI"}", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                message.reasoningLevel?.let { Text("· $it", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                                Text(message.modelName ?: "AI", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                message.reasoningLevel?.let { Text("· ${reasoningLevelLabel(it)}", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
                                 message.requestDurationMs?.let { Text("· ${(it / 1000.0).let { time -> String.format(currentLocale, "%.1f 秒", time) }}", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
                             }
                         }
@@ -913,6 +1064,208 @@ private fun MessageRow(
                 }
             }
         }
+    }
+}
+
+/** 单段解题内容的界面类型。 */
+internal enum class SolutionBlockStyle {
+    HEADING,
+    STEP,
+    EQUATION,
+    ANSWER,
+}
+
+/** 解题流程中保留原文的一段内容。 */
+internal data class SolutionBlock(
+    val content: String,
+    val style: SolutionBlockStyle,
+)
+
+/** 将回答按标题、说明、公式和结论切分，供图形化解题流程展示。 */
+internal fun parseSolutionFlow(value: String): List<SolutionBlock> = value
+    .trim()
+    .split(Regex("\\n\\s*\\n+"))
+    .map(String::trim)
+    .filter(String::isNotEmpty)
+    .map { paragraph ->
+        val normalized = paragraph.removePrefix("**").removeSuffix("**").trim()
+        val hasChinese = paragraph.any { it in '\u4e00'..'\u9fff' }
+        val hasMathNotation = paragraph.contains('\\') || paragraph.contains('$') || paragraph.contains('=')
+        val isAnswer = Regex("\\\\boxed|最终答案|所以答案|因此答案|答案是|答案[:：]").containsMatchIn(paragraph)
+        val isHeading = paragraph.length <= 24 && (
+            paragraph.startsWith("#") || paragraph.startsWith("**") ||
+                normalized.endsWith("：") || normalized.endsWith(":") ||
+                normalized.length <= 8 && !normalized.contains(" ") && hasChinese
+            )
+        val isEquation = !hasChinese && hasMathNotation && paragraph.count(Char::isLetter) <= 18
+
+        val style = when {
+            isAnswer -> SolutionBlockStyle.ANSWER
+            isHeading -> SolutionBlockStyle.HEADING
+            isEquation -> SolutionBlockStyle.EQUATION
+            else -> SolutionBlockStyle.STEP
+        }
+        SolutionBlock(content = paragraph.replace(Regex("^#{1,6}\\s+"), ""), style = style)
+    }
+
+/** 以连续步骤、公式卡片和结论卡片呈现助手回答。 */
+@Composable
+private fun SolutionFlow(value: String) {
+    val blocks = remember(value) { parseSolutionFlow(value) }
+    Column(verticalArrangement = Arrangement.spacedBy(9.dp)) {
+        blocks.forEach { block ->
+            when (block.style) {
+                SolutionBlockStyle.HEADING -> Text(
+                    text = richText(block.content),
+                    fontSize = 14.sp,
+                    lineHeight = 22.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+
+                SolutionBlockStyle.STEP -> {
+                    MathContent(
+                        value = block.content,
+                        modifier = Modifier.fillMaxWidth(),
+                        fontSize = 15.sp,
+                        lineHeight = 25.sp,
+                        color = MaterialTheme.colorScheme.onBackground,
+                    )
+                }
+
+                SolutionBlockStyle.EQUATION -> Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+                ) {
+                    MathContent(
+                        value = block.content,
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp),
+                        fontSize = 16.sp,
+                        lineHeight = 26.sp,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                    )
+                }
+
+                SolutionBlockStyle.ANSWER -> Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp),
+                    color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.28f),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.45f)),
+                ) {
+                    MathContent(
+                        value = block.content,
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 15.dp, vertical = 12.dp),
+                        fontSize = 16.sp,
+                        lineHeight = 25.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onBackground,
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** 在普通文字中按内容高度绘制连续的数学矩阵括号。 */
+@Composable
+private fun MathContent(
+    value: String,
+    modifier: Modifier,
+    fontSize: androidx.compose.ui.unit.TextUnit,
+    lineHeight: androidx.compose.ui.unit.TextUnit,
+    color: Color,
+    fontWeight: FontWeight = FontWeight.Normal,
+    textAlign: androidx.compose.ui.text.style.TextAlign? = null,
+) {
+    val matrixPattern = Regex("\\\\begin\\{(bmatrix|pmatrix|Bmatrix|vmatrix|Vmatrix|matrix)\\}([\\s\\S]*?)\\\\end\\{\\1\\}")
+    val matrices = matrixPattern.findAll(value).toList()
+    if (matrices.isEmpty()) {
+        Text(richText(value), modifier, fontSize = fontSize, lineHeight = lineHeight, color = color, fontWeight = fontWeight, textAlign = textAlign)
+        return
+    }
+    Column(modifier, verticalArrangement = Arrangement.spacedBy(3.dp)) {
+        var cursor = 0
+        matrices.forEach { match ->
+            if (match.range.first > cursor) {
+                Text(richText(value.substring(cursor, match.range.first)), fontSize = fontSize, lineHeight = lineHeight, color = color, fontWeight = fontWeight, textAlign = textAlign)
+            }
+            val rows = match.groupValues[2].split(Regex("\\\\\\\\"))
+            val environment = match.groupValues[1]
+            val opening = when (environment) {
+                "pmatrix" -> "("
+                "Bmatrix" -> "{"
+                "vmatrix" -> "|"
+                "Vmatrix" -> "‖"
+                "bmatrix" -> "["
+                else -> ""
+            }
+            val closing = when (environment) {
+                "pmatrix" -> ")"
+                "Bmatrix" -> "}"
+                "vmatrix" -> "|"
+                "Vmatrix" -> "‖"
+                "bmatrix" -> "]"
+                else -> ""
+            }
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                if (opening.isNotEmpty()) MatrixDelimiter(opening, rows.size, lineHeight, color)
+                Column {
+                    rows.forEach { row ->
+                        Text(
+                            richText(row.split('&').joinToString("   ") { it.trim() }),
+                            fontSize = fontSize,
+                            lineHeight = lineHeight,
+                            color = color,
+                            fontWeight = fontWeight,
+                        )
+                    }
+                }
+                if (closing.isNotEmpty()) MatrixDelimiter(closing, rows.size, lineHeight, color)
+            }
+            cursor = match.range.last + 1
+        }
+        if (cursor < value.length) {
+            Text(richText(value.substring(cursor)), fontSize = fontSize, lineHeight = lineHeight, color = color, fontWeight = fontWeight, textAlign = textAlign)
+        }
+    }
+}
+
+/** 绘制单笔连续矩阵定界符，并随矩阵行数调整高度。 */
+@Composable
+private fun MatrixDelimiter(
+    delimiter: String,
+    rowCount: Int,
+    lineHeight: androidx.compose.ui.unit.TextUnit,
+    color: Color,
+) {
+    val height = (lineHeight.value * rowCount).dp
+    Canvas(Modifier.width(9.dp).height(height)) {
+        val inset = size.width * 0.2f
+        val edge = if (delimiter == "]" || delimiter == ")" || delimiter == "}") size.width - inset else inset
+        val inner = if (edge == inset) size.width - inset else inset
+        val path = Path().apply {
+            if (delimiter == "|") {
+                moveTo(size.width / 2f, 0f)
+                lineTo(size.width / 2f, size.height)
+            } else if (delimiter == "‖") {
+                moveTo(size.width * 0.35f, 0f)
+                lineTo(size.width * 0.35f, size.height)
+                moveTo(size.width * 0.65f, 0f)
+                lineTo(size.width * 0.65f, size.height)
+            } else if (delimiter == "(" || delimiter == ")") {
+                moveTo(inner, 0f)
+                cubicTo(edge, size.height * 0.2f, edge, size.height * 0.8f, inner, size.height)
+            } else {
+                moveTo(inner, 0f)
+                lineTo(edge, 0f)
+                lineTo(edge, size.height)
+                lineTo(inner, size.height)
+            }
+        }
+        drawPath(path, color, style = Stroke(width = 2.dp.toPx()))
     }
 }
 
@@ -933,13 +1286,26 @@ private fun ModelPickerSheet(
     var refreshingProviderId by remember { mutableStateOf<String?>(null) }
     var search by remember { mutableStateOf("") }
     var manualModelProvider by remember { mutableStateOf<ProviderConnectionInfo?>(null) }
-    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheetState, shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp)) {
-        Column(Modifier.fillMaxWidth().padding(horizontal = 21.dp).padding(bottom = 30.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("选择模型", fontSize = 22.sp, fontWeight = FontWeight.Bold)
-            Text("模型能力按服务商目录推断。", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        LiquidGlassSurface(
+            modifier = Modifier.fillMaxSize(),
+            shape = RoundedCornerShape(0.dp),
+            color = MaterialTheme.colorScheme.background,
+        ) {
+        Column(
+            Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()
+                .padding(horizontal = 18.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("选择模型", fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                    Text("模型能力按服务商目录推断。", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                TextButton(onClick = onDismiss) { Text("关闭") }
+            }
             OutlinedTextField(search, { search = it }, Modifier.fillMaxWidth(), label = { Text("搜索模型") }, singleLine = true)
-            LazyColumn(Modifier.heightIn(max = 480.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
+            LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(9.dp)) {
                 connections.forEach { connection ->
                     item(key = "header:${connection.id}") {
                         Row(Modifier.fillMaxWidth().padding(top = 7.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
@@ -979,6 +1345,7 @@ private fun ModelPickerSheet(
             }
             TextButton(onClick = onManageProviders, modifier = Modifier.align(Alignment.CenterHorizontally)) { Text("管理服务商连接") }
         }
+        }
     }
     manualModelProvider?.let { connection ->
         ManualModelDialog(connection.connectionDisplayName(), onDismiss = { manualModelProvider = null }, onConfirm = { id ->
@@ -1004,17 +1371,16 @@ private fun ModelOption(
             .clickable(onClick = onClick).padding(horizontal = 12.dp, vertical = 9.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(9.dp)) {
-            Text(if (selected) "●" else "○", color = MaterialTheme.colorScheme.primary, fontSize = 14.sp)
             Column(Modifier.weight(1f)) {
                 Text(model.name, fontSize = 13.sp, fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Text(model.id, fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
             if (model.supportsImages || connection.customSupportsImages) StatusPill("图片", "支持图片输入", MaterialTheme.colorScheme.primaryContainer, MaterialTheme.colorScheme.onPrimaryContainer)
+            if (selected) Text("✓", color = MaterialTheme.colorScheme.onSurface, fontSize = 19.sp)
         }
         if (selected && model.reasoningLevels.isNotEmpty()) {
             Row(Modifier.padding(start = 21.dp, top = 8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 model.reasoningLevels.forEach { level ->
-                    FilterChip(label = level, selected = reasoningLevel == level, onClick = { onReasoning(if (reasoningLevel == level) null else level) })
+                    FilterChip(label = reasoningLevelLabel(level), selected = reasoningLevel == level, onClick = { onReasoning(if (reasoningLevel == level) null else level) })
                 }
             }
         }
@@ -1131,82 +1497,101 @@ private fun ProviderEditorDialog(
     )
 }
 
-/** 提供商设置面板独立滚动内容，并避免面板拖拽与卡片滚动争抢手势。 */
+/** 展示全屏设置主页，以及主题和通知二级页面。 */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ProviderSettingsSheet(
+private fun SettingsScreen(
     state: ChatUiState,
     onAddConnection: () -> Unit,
     onEditConnection: (String) -> Unit,
     onDeleteConnection: (ProviderConnectionInfo) -> Unit,
     onRefreshModels: (String, (Result<List<ModelInfo>>) -> Unit) -> Unit,
-    onThemeSelected: (String) -> Unit,
+    appearance: AppearanceSettings,
+    onAppearanceChanged: (AppearanceSettings) -> Unit,
     onClose: () -> Unit,
 ) {
     var pendingDelete by remember { mutableStateOf<ProviderConnectionInfo?>(null) }
+    var showingTheme by rememberSaveable { mutableStateOf(false) }
+    var showingNotifications by rememberSaveable { mutableStateOf(false) }
     val context = LocalContext.current
-    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    ModalBottomSheet(
-        onDismissRequest = onClose,
-        sheetState = sheetState,
-        sheetGesturesEnabled = false,
-        dragHandle = null,
-        shape = RoundedCornerShape(topStart = 27.dp, topEnd = 27.dp),
-    ) {
-        Column(
-            Modifier.fillMaxWidth()
-                .heightIn(max = 740.dp)
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 19.dp)
-                .padding(bottom = 32.dp),
-            verticalArrangement = Arrangement.spacedBy(15.dp),
-        ) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                Column {
-                    Text("设置", fontWeight = FontWeight.Bold, fontSize = 23.sp)
-                    Text("API Key 与会话保存在本机", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-                CircleIconButton("关闭设置", "×", onClose)
-            }
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                Text("模型服务商", fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
-                TextButton(onClick = onAddConnection) { Text("＋ 添加") }
-            }
-            if (state.snapshot.connections.isEmpty()) Text("添加 API Key 后即可连接模型。", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            state.snapshot.connections.forEach { connection ->
-                ConnectionSettingsCard(
-                    connection = connection,
-                    isSelected = connection.id == state.selectedProviderId,
-                    onEdit = { onEditConnection(connection.id) },
-                    onDelete = { pendingDelete = connection },
-                    onRefresh = { onRefreshModels(connection.id) {} },
+    BackHandler(enabled = showingTheme || showingNotifications) {
+        showingTheme = false
+        showingNotifications = false
+    }
+    Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+            if (showingNotifications) {
+                NotificationSettingsPage(
+                    onBack = { showingNotifications = false },
+                    onManageNotifications = { openAppPromotedNotificationSettings(context) },
                 )
-            }
-            HorizontalDivider()
-            Text("应用外观", fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-                listOf("system" to "◐ 系统", "light" to "☀ 浅色", "dark" to "☾ 深色").forEach { (value, label) ->
-                    FilterChip(label = label, selected = state.snapshot.preferences.themeMode == value, onClick = { onThemeSelected(value) }, modifier = Modifier.weight(1f))
+            } else if (showingTheme) {
+                AppearanceSettingsPage(
+                    appearance = appearance,
+                    onAppearanceChanged = onAppearanceChanged,
+                    onBack = { showingTheme = false },
+                )
+            } else {
+                Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()) {
+                    Row(
+                        Modifier.fillMaxWidth().padding(horizontal = 19.dp, vertical = 12.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column {
+                            Text("设置", fontWeight = FontWeight.Bold, fontSize = 23.sp)
+                            Text("API Key 与会话保存在本机", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        CircleIconButton("关闭设置", "×", onClose)
+                    }
+                    Column(
+                        Modifier.weight(1f).verticalScroll(rememberScrollState())
+                            .padding(horizontal = 19.dp).padding(bottom = 28.dp),
+                        verticalArrangement = Arrangement.spacedBy(15.dp),
+                    ) {
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                            Text("模型服务商", fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
+                            TextButton(onClick = onAddConnection) { Text("＋ 添加") }
+                        }
+                        if (state.snapshot.connections.isEmpty()) Text("添加 API Key 后即可连接模型。", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        state.snapshot.connections.forEach { connection ->
+                            ConnectionSettingsCard(
+                                connection = connection,
+                                isSelected = connection.id == state.selectedProviderId,
+                                onEdit = { onEditConnection(connection.id) },
+                                onDelete = { pendingDelete = connection },
+                                onRefresh = { onRefreshModels(connection.id) {} },
+                            )
+                        }
+                        HorizontalDivider()
+                        Text("个性化", fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
+                        SettingsNavigationCard(
+                            title = "主题",
+                            detail = "深浅模式、动态色、液态玻璃和页面缩放",
+                            onClick = { showingTheme = true },
+                        )
+                        HorizontalDivider()
+                        Text("数据和隐私", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            "对话、图片与 API 配置仅储存在应用私有区域，Android 备份已停用。AI 摘要会将最近的文字内容发送至生成回答的同一服务商，可能产生额外费用，摘要请求不发送图片。API Key 由 Android Keystore 加密保护。",
+                            fontSize = 12.sp,
+                            lineHeight = 18.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        HorizontalDivider()
+                        Text("系统权限", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                        SettingsNavigationCard(
+                            title = "通知",
+                            detail = "查看通知权限并管理后台完成提醒",
+                            onClick = { showingNotifications = true },
+                        )
+                        TextButton(onClick = { openAppSettings(context) }, modifier = Modifier.fillMaxWidth()) {
+                            Text("设置相机权限")
+                        }
+                    }
                 }
-            }
-            HorizontalDivider()
-            Text("数据和隐私", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-            Text(
-                "对话、图片与 API 配置仅储存在应用私有区域，Android 备份已停用。发送前会显示服务商及所传内容。API Key 由 Android Keystore 加密保护。",
-                fontSize = 12.sp,
-                lineHeight = 18.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            HorizontalDivider()
-            Text("系统权限", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
-            TextButton(onClick = { openAppNotificationSettings(context) }, modifier = Modifier.fillMaxWidth()) {
-                Text("设置后台完成通知权限")
-            }
-            TextButton(onClick = { openAppSettings(context) }, modifier = Modifier.fillMaxWidth()) {
-                Text("设置相机权限")
-            }
-            Text("外观动画以轻量圆角、透明层次及关键转场为主。", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
+    }
     }
     pendingDelete?.let { connection ->
         AlertDialog(
@@ -1216,6 +1601,23 @@ private fun ProviderSettingsSheet(
             confirmButton = { TextButton(onClick = { onDeleteConnection(connection); pendingDelete = null }) { Text("删除") } },
             dismissButton = { TextButton(onClick = { pendingDelete = null }) { Text("取消") } },
         )
+    }
+}
+
+/** 显示可进入二级设置页面的导航卡片。 */
+@Composable
+private fun SettingsNavigationCard(title: String, detail: String, onClick: () -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(17.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.48f))
+            .clickable(onClick = onClick).padding(horizontal = 15.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(title, fontWeight = FontWeight.SemiBold)
+            Text(detail, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        Text("›", fontSize = 24.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 
@@ -1471,6 +1873,21 @@ private fun openAppNotificationSettings(context: android.content.Context) {
     runCatching { context.startActivity(intent) }.onFailure { openAppSettings(context) }
 }
 
+/** 打开 Android 16 实时通知授权页，并在系统不支持时回退到普通通知设置。 */
+private fun openAppPromotedNotificationSettings(context: android.content.Context) {
+    val promotedSettings = if (Build.VERSION.SDK_INT >= 36) {
+        android.content.Intent("android.settings.MANAGE_APP_PROMOTED_NOTIFICATIONS")
+            .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, context.packageName)
+    } else {
+        null
+    }
+    val fallbackSettings = android.content.Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+        .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, context.packageName)
+    val intent = promotedSettings?.takeIf { it.resolveActivity(context.packageManager) != null } ?: fallbackSettings
+    runCatching { context.startActivity(intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)) }
+        .onFailure { openAppNotificationSettings(context) }
+}
+
 /** 在发送前预处理易读的 Markdown 文本及代码格式。 */
 @Composable
 private fun richText(value: String): AnnotatedString {
@@ -1517,7 +1934,7 @@ private fun richText(value: String): AnnotatedString {
 }
 
 /** 将常用 LaTeX 数学分隔符和命令转换为可直接阅读的数学符号。 */
-private fun renderMathMarkup(value: String): String {
+internal fun renderMathMarkup(value: String): String {
     val superscriptCharacters = mapOf(
         '0' to '⁰', '1' to '¹', '2' to '²', '3' to '³', '4' to '⁴',
         '5' to '⁵', '6' to '⁶', '7' to '⁷', '8' to '⁸', '9' to '⁹',
@@ -1536,9 +1953,27 @@ private fun renderMathMarkup(value: String): String {
         .replace(Regex("(?<!\\\\)\\$"), "")
         .replace(Regex("\\\\(?:left|right)\\b"), "")
 
-    val fractions = Regex("\\\\frac\\s*\\{([^{}]*)}\\s*\\{([^{}]*)}")
+    val matrixPattern = Regex("\\\\begin\\{(bmatrix|pmatrix|Bmatrix|vmatrix|Vmatrix|matrix)\\}([\\s\\S]*?)\\\\end\\{\\1\\}")
+    rendered = matrixPattern.replace(rendered) { match ->
+            val environment = match.groupValues[1]
+            val rows = match.groupValues[2].split(Regex("\\\\\\\\"))
+                .map { row -> row.trim().split('&').joinToString("   ") { it.trim() } }
+            val (opening, closing) = when (environment) {
+                "bmatrix" -> "[" to "]"
+                "pmatrix" -> "(" to ")"
+                "Bmatrix" -> "{" to "}"
+                "vmatrix" -> "|" to "|"
+                "Vmatrix" -> "‖" to "‖"
+                else -> "" to ""
+            }
+            if (opening.isEmpty()) rows.joinToString("\n")
+            else rows.joinToString("\n") { row -> "$opening$row$closing" }
+        }
+    rendered = rendered.replace("\\\\", "\n").replace("&", "   ")
+
+    val fractions = Regex("\\\\frac\\s*\\{([^{}]*)\\}\\s*\\{([^{}]*)\\}")
     rendered = fractions.replace(rendered) { match -> "${match.groupValues[1]}⁄${match.groupValues[2]}" }
-    val boxedValues = Regex("\\\\boxed\\s*\\{([^{}]*)}")
+    val boxedValues = Regex("\\\\boxed\\s*\\{([^{}]*)\\}")
     rendered = boxedValues.replace(rendered) { match -> "[${match.groupValues[1]}]" }
 
     val commands = mapOf(
@@ -1548,23 +1983,26 @@ private fun renderMathMarkup(value: String): String {
         "\\neq" to "≠", "\\ne" to "≠", "\\approx" to "≈",
         "\\infty" to "∞", "\\pi" to "π", "\\sqrt" to "√",
         "\\sum" to "∑", "\\prod" to "∏", "\\int" to "∫",
+        "\\det" to "det", "\\dim" to "dim", "\\ln" to "ln",
         "\\rightarrow" to "→", "\\to" to "→", "\\alpha" to "α",
         "\\beta" to "β", "\\theta" to "θ", "\\lambda" to "λ",
         "\\mu" to "μ", "\\sigma" to "σ", "\\Delta" to "Δ",
     )
     commands.forEach { (command, symbol) -> rendered = rendered.replace(command, symbol) }
-    rendered = rendered.replace(Regex("\\\\(?:text|mathrm|mathbf)\\s*\\{([^{}]*)}"), "$1")
+    rendered = rendered.replace(Regex("\\\\(?:text|mathrm|mathbf)\\s*\\{([^{}]*)\\}"), "$1")
     rendered = rendered.replace(Regex("\\\\(?:,|;|!)"), " ")
 
-    rendered = Regex("\\^\\s*(?:\\{([^{}]*)}|([\\w+\\-=()]))").replace(rendered) { match ->
+    rendered = Regex("\\^\\s*(?:\\{([^{}]*)\\}|([\\w+\\-=()]))").replace(rendered) { match ->
         val exponent = match.groups[1]?.value ?: match.groups[2]?.value.orEmpty()
         exponent.map { superscriptCharacters[it] ?: it }.joinToString("")
     }
-    rendered = Regex("_\\s*(?:\\{([^{}]*)}|([\\w+\\-=()]))").replace(rendered) { match ->
+    rendered = Regex("_\\s*(?:\\{([^{}]*)\\}|([\\w+\\-=()]))").replace(rendered) { match ->
         val index = match.groups[1]?.value ?: match.groups[2]?.value.orEmpty()
         index.map { subscriptCharacters[it] ?: it }.joinToString("")
     }
-    return rendered.replace("{", "").replace("}", "").replace(Regex("\\\\([{}])"), "$1")
+    return rendered
+        .replace("{", "").replace("}", "")
+        .replace(Regex("\\\\([{}])"), "$1")
 }
 
 /** 计算正在生成任务的简洁耗时标签。 */
@@ -1637,6 +2075,17 @@ private fun PreferenceToggleRow(title: String, selected: Boolean, onClick: (Bool
 }
 
 /** 显示历史会话的最后活跃本地时间。 */
+/** 将服务商协议档位映射为设置界面使用的中文标签。 */
+private fun reasoningLevelLabel(value: String): String = when (value.lowercase(Locale.ROOT)) {
+    "minimal" -> "最小"
+    "low" -> "低"
+    "medium" -> "中"
+    "high" -> "高"
+    "xhigh" -> "超高"
+    else -> value
+}
+
+/** 将毫秒时间戳按当前系统区域显示为简短时间。 */
 private fun Long.displayTimestamp(): String = DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(this))
 
 /** 通过 Compose 的可见性状态为输入栏的 ime 预留系统安全区。 */

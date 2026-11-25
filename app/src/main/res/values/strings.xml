@@ -1,5 +1,5 @@
 <resources>
-    <string name="app_name">多模型 AI</string>
+    <string name="app_name">Phone TS</string>
     <string name="chat_message_placeholder">发送消息</string>
     <string name="chat_message_placeholder_with_model">使用 %1$s 发送消息</string>
 </resources>
